@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 INPUT = ROOT / "inputs/m2/A-M2-01_하자접수대장_week1.csv"
 OUT = ROOT / "outputs/m2"
 SRC = INPUT.name
+SUPP = ROOT / "outputs/m3/supplement_A-M3-03.csv"  # 정정 메모(A-M3-03) 누락 접수분. 원본 CSV는 수정하지 않고 별도 파일로 보완
 
 PYEONG = Decimal("3.3058")  # 가정값: 자료에 근거 없음 (rules 문서의 확인 필요 항목)
 DATE_MIN, DATE_MAX = date(2026, 10, 26), date(2026, 10, 30)
@@ -39,6 +40,14 @@ def main():
     with open(INPUT, "r", encoding="utf-8-sig", newline="") as f:  # 읽기 전용
         rows = list(csv.reader(f))
     header, data = rows[0], rows[1:]
+    n_orig = len(data)
+    n_supp = 0
+    if SUPP.exists():
+        with open(SUPP, "r", encoding="utf-8-sig", newline="") as f:
+            srows = list(csv.reader(f))
+        assert srows[0] == header, "보완 파일 머리행이 원본과 다름"
+        data = data + srows[1:]
+        n_supp = len(srows) - 1
     col = {name: i for i, name in enumerate(header)}
 
     excluded = []   # (행번호, 사유, 원본값)
@@ -175,7 +184,7 @@ def main():
         m = re.match(r"(\d+)", orig_total[col["하자내용"]])
         orig_cnt = int(m[1]) if m else None
         orig_area = Decimal(orig_total[col["보수면적"]]) if orig_total[col["보수면적"]] else None
-    raw_sum = sum((Decimal(r["area_s"]) for r in kept if r["area_s"]), Decimal(0))
+    raw_sum = sum((Decimal(r["area_s"]) for r in kept if r["area_s"] and r["n"] <= n_orig), Decimal(0))
 
     L = []
     L.append("# M2 실행 기록\n")
@@ -186,7 +195,7 @@ def main():
     L.append(f"- 입력 SHA-256 실행 전/후: {hash_before[:16]}… / {hash_after[:16]}… → {'동일(수정 없음)' if hash_before == hash_after else '불일치!'}")
     L.append(f"- 평→㎡ 환산 계수: {PYEONG} {{확인 필요: 자료에 근거 없는 가정값}}\n")
     L.append("## 행 수 전후")
-    L.append(f"- 처리 전: 데이터 {len(data)}행 (합계 행 포함)")
+    L.append(f"- 처리 전: 데이터 {n_orig}행 (합계 행 포함)" + (f" + 보완 {n_supp}행(`outputs/m3/supplement_A-M3-03.csv`, 원본 {n_orig + 1}~{n_orig + n_supp}번)" if n_supp else ""))
     L.append(f"- 처리 후: 집계 포함 {len(kept)}행, 제외 {len(excluded)}행\n")
     L.append("## 규칙별 제외 수")
     L.append("| 규칙 | 제외 수 | 원본행 |")
@@ -208,8 +217,8 @@ def main():
     L.append("\n## 합계 대조 (규칙 8)")
     L.append(f"- 원본 합계 행: 건수 {orig_cnt}건, 면적 {orig_area}")
     L.append(f"- 처리 결과: 건수 {len(kept)}건, 면적 {total_area}㎡")
-    L.append(f"- 건수 차이 {None if orig_cnt is None else orig_cnt - len(kept)}건: 규칙2 완전 중복 제외 {excl_by_rule['2']}건")
-    L.append(f"- 면적: 원본 {orig_area}는 ㎡·평 혼합 단순합. 포함 행의 원본 숫자 단순합 {raw_sum}, 평 환산 후 {total_area}㎡")
+    L.append(f"- 건수 차이 {None if orig_cnt is None else orig_cnt - (len(kept) - n_supp)}건(보완 {n_supp}건 제외 기준): 규칙2 완전 중복 제외 {excl_by_rule['2']}건")
+    L.append(f"- 면적: 원본 {orig_area}는 ㎡·평 혼합 단순합. 포함 행(보완 제외)의 원본 숫자 단순합 {raw_sum}, 보완 {n_supp}건 면적 포함·평 환산 후 {total_area}㎡")
     (OUT / "run_log.md").write_text("\n".join(L) + "\n", encoding="utf-8")
     print(f"포함 {len(kept)}행 / 제외 {len(excluded)}행 / 면적 {total_area}㎡ / 입력 불변={hash_before == hash_after}")
 
