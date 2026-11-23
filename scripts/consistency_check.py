@@ -15,6 +15,11 @@ DOCS = [  # (파일, 5절만 여부)
     ("inputs/m3/A-M3-02_하자집계_업무보고서_초안.md", None),
     ("outputs/m1/minutes.md", "## 5."),
 ]
+FIXED_DOCS = [  # 고친 뒤 검사 대상(--fixed)
+    ("outputs/m3/doc_A-M3-01.md", None),
+    ("outputs/m3/doc_A-M3-02.md", None),
+    ("outputs/m1/minutes.md", "## 5."),
+]
 WD = "월화수목금토일"
 DATE_RE = re.compile(r"(?:(\d{4})\.\s*)?(\d{1,2})\.\s*(\d{1,2})\.\s*\(([월화수목금토일])\)")
 FULL_DATE_RE = re.compile(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.")
@@ -96,11 +101,12 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--out")
     ap.add_argument("--append", action="store_true")
+    ap.add_argument("--fixed", action="store_true", help="고친 문서(outputs/m3/doc_*.md)로 검사")
     a = ap.parse_args()
     led = load_ledger()
     L = [f"## {a.label}\n" if a.label else "", "대장: `ledger/ledger.csv` (읽기). minutes.md는 5절만 검사. 실행: `python3 scripts/consistency_check.py`\n"]
     tot = bad = 0
-    for path, only in DOCS:
+    for path, only in (FIXED_DOCS if a.fixed else DOCS):
         res = check_doc(path, only, led)
         b = [r for r in res if r[5] == "불일치"]
         tot += len(res)
