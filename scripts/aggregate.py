@@ -1,226 +1,136 @@
-#!/usr/bin/env python3
-"""M2 하자접수대장 집계. 규칙: rules/aggregation_rules.md (표준 라이브러리만 사용)."""
+# -*- coding: utf-8 -*-
+"""하자 접수대장 집계 — rules/aggregation_rules.md 기준 (강사 백업본, Python 표준 라이브러리만).
+
+사용(레포 루트에서):
+  python scripts/aggregate.py inputs/m2/A-M2-01_하자접수대장_week1.csv --out outputs/m2
+출력: summary.csv(공종·처리상태·긴급·면적), excluded_rows.csv(원본행·사유·원본값), run_log.md
+검사 순서: 합계 행 → 위치코드 정규화 → 중복(접수번호 / 위치·공종·접수일) → 면적 환산(평 → ㎡)
+원본 CSV는 읽기만 한다.
+"""
+import argparse
 import csv
-import hashlib
+import os
 import re
-import sys
-from collections import Counter, OrderedDict
-from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-INPUT = ROOT / "inputs/m2/A-M2-01_하자접수대장_week1.csv"
-OUT = ROOT / "outputs/m2"
-SRC = INPUT.name
-SUPP = ROOT / "outputs/m3/supplement_A-M3-03.csv"  # 정정 메모(A-M3-03) 누락 접수분. 원본 CSV는 수정하지 않고 별도 파일로 보완
-
-PYEONG = Decimal("3.3058")  # 가정값: 자료에 근거 없음 (rules 문서의 확인 필요 항목)
-DATE_MIN, DATE_MAX = date(2026, 10, 26), date(2026, 10, 30)
-URGENCY = {"긴급", "일반"}
-STATUS = {"접수", "처리중", "완료"}
-UNITS = {"㎡", "평"}
-LOC_STD = re.compile(r"^\d{3}-\d{3,4}-[^\s-]+$")
-LOC_KO = re.compile(r"^(\d{3})동\s*(\d{3,4})호\s*([^\s-]+)$")
-LOC_SPACE = re.compile(r"^(\d{3}-\d{3,4})\s+([^\s-]+)$")
-LOC_NOSEP = re.compile(r"^\d{6,7}$")
-ID_RE = re.compile(r"^HA-\d+$")
+NOTICE = ("> [가상 자료] 이 자료의 기관·인물·지구·업체·수치·연락처는 모두 실습용 가상 정보입니다. "
+          "실제 사실이 아니며 실무에 사용할 수 없습니다.")
+TYPES = ["마감", "창호", "설비", "전기", "방수결로"]
+STATUSES = ["접수", "처리중", "완료"]
+PYEONG = Decimal("3.3058")
+STD = re.compile(r"^(\d{3})-(\d{3,4})-([가-힣]+)$")
+ALT = [re.compile(r"^(\d{3})동\s*(\d{3,4})호\s+([가-힣]+)$"),   # 103동 1204호 욕실
+       re.compile(r"^(\d{3})-(\d{3,4})\s+([가-힣]+)$")]          # 103-1204 욕실
 
 
-def sha256(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def normalize_location(raw):
+    """(표준 위치코드 또는 None, 고쳤는지)"""
+    s = raw.strip()
+    m = STD.match(s)
+    changed = False
+    if not m:
+        for p in ALT:
+            m = p.match(s)
+            if m:
+                changed = True
+                break
+    if not m or not 101 <= int(m.group(1)) <= 112:
+        return None, False
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}", changed
 
 
-def q2(x):
-    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def check_date(raw):
+    """접수일 검사(M2 기준에는 접수일 규칙이 없으므로 그대로 쓴다)."""
+    return raw.strip(), None
 
 
 def main():
-    hash_before = sha256(INPUT)
-    with open(INPUT, "r", encoding="utf-8-sig", newline="") as f:  # 읽기 전용
-        rows = list(csv.reader(f))
-    header, data = rows[0], rows[1:]
-    n_orig = len(data)
-    n_supp = 0
-    if SUPP.exists():
-        with open(SUPP, "r", encoding="utf-8-sig", newline="") as f:
-            srows = list(csv.reader(f))
-        assert srows[0] == header, "보완 파일 머리행이 원본과 다름"
-        data = data + srows[1:]
-        n_supp = len(srows) - 1
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input")
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+    with open(a.input, encoding="utf-8-sig", newline="") as f:
+        rd = csv.reader(f)
+        header = next(rd)
+        rows = [r for r in rd]
     col = {name: i for i, name in enumerate(header)}
 
-    excluded = []   # (행번호, 사유, 원본값)
-    excl_by_rule = Counter()
-    fixed = []      # 고쳐서 포함
-    flags = []      # 포함하되 확인 필요
-    kept = []       # dict 목록
-
-    def exclude(n, rule, reason, row):
-        excluded.append((n, f"규칙{rule}: {reason}", ",".join(row)))
-        excl_by_rule[rule] += 1
-
-    seen_ids = {}
-    for n, row in enumerate(data, 1):
-        g = lambda k: row[col[k]].strip() if len(row) > col[k] else ""
-        rid = g("접수번호")
-
-        # 1 합계 행
-        if not ID_RE.match(rid):
-            exclude(n, "1", f"합계 행(접수번호 '{rid}')", row)
+    kept, excluded, fixed = [], [], []
+    seen_no, seen_key = set(), set()
+    for n, r in enumerate(rows, 1):
+        no = r[col["접수번호"]].strip()
+        if no == "합계":
+            excluded.append((n, "합계 행", r))
             continue
-        # 2 / 2a 접수번호 중복
-        if rid in seen_ids:
-            if row == seen_ids[rid][1]:
-                exclude(n, "2", f"완전 중복({rid}, 첫 행 {seen_ids[rid][0]}번 유지)", row)
-                continue
-            flags.append((n, f"규칙2a: {rid} 접수번호가 {seen_ids[rid][0]}번과 같고 내용이 다름 | 포함 | {{확인 필요: 어느 쪽이 맞는지}}"))
-        else:
-            seen_ids[rid] = (n, row)
-
-        rec = {"n": n, "id": rid, "date": g("접수일"), "loc": g("위치코드"), "trade": g("공종"),
-               "content": g("하자내용"), "urg": g("긴급구분"), "status": g("처리상태"),
-               "area_s": g("보수면적"), "unit": g("면적단위"), "row": row}
-
-        # 4 위치코드 표준화 (제외 규칙 아님: 고치거나 표시)
-        loc = rec["loc"]
-        if not LOC_STD.match(loc):
-            m = LOC_KO.match(loc)
-            m2 = LOC_SPACE.match(loc)
-            if m:
-                rec["loc"] = f"{m[1]}-{m[2]}-{m[3]}"
-            elif m2:
-                rec["loc"] = f"{m2[1]}-{m2[2]}"
-            if rec["loc"] != loc:
-                fixed.append((n, f"규칙4: 위치코드 | {loc} → {rec['loc']}"))
-            elif LOC_NOSEP.match(loc):
-                flags.append((n, f"규칙4a: 위치코드 '{loc}' 구분자 없음 | 포함 | {{확인 필요: 동·호}}"))
-            else:
-                flags.append((n, f"규칙4: 위치코드 '{loc}' 비표준, 복원 불가 | 포함 | {{확인 필요: 위치}}"))
-        if re.search(r"\d{3,4}호", rec["content"]):
-            flags.append((n, f"규칙4b: 하자내용에 다른 세대 정보 '{rec['content']}' | 포함 | 원문 유지"))
-
-        # 7 형식·범위 (날짜, 구분값, 상태값)
-        try:
-            d = datetime.strptime(rec["date"], "%Y-%m-%d").date()
-            if not DATE_MIN <= d <= DATE_MAX:
-                exclude(n, "7", f"접수일 범위 밖({rec['date']})", row)
-                continue
-        except ValueError:
-            exclude(n, "7", f"접수일 형식 오류({rec['date']})", row)
+        code, loc_changed = normalize_location(r[col["위치코드"]])
+        if code is None:
+            excluded.append((n, "위치 확인 필요", r))
             continue
-        if rec["urg"] not in URGENCY:
-            exclude(n, "7", f"긴급구분 값 오류({rec['urg']})", row)
+        notes = []
+        if loc_changed:
+            notes.append(f"위치코드 {r[col['위치코드']].strip()} → {code}")
+        date, date_note = check_date(r[col["접수일"]])
+        if date is None:
+            excluded.append((n, "날짜 확인 필요", r))
             continue
-        if rec["status"] not in STATUS:
-            exclude(n, "7", f"처리상태 값 오류({rec['status']})", row)
+        if date_note:
+            notes.append(date_note)
+        if no in seen_no:
+            excluded.append((n, "중복(접수번호)", r))
             continue
-
-        # 5, 6 면적·단위
-        a, u = rec["area_s"], rec["unit"]
-        rec["area"] = None
-        if a == "" and u == "":
-            pass  # 6: 건수만 포함
-        elif a == "" or u == "":
-            exclude(n, "6", f"면적·단위 한쪽만 공란(면적='{a}', 단위='{u}')", row)
+        key = (code, r[col["공종"]].strip(), date)
+        if key in seen_key:
+            excluded.append((n, "중복(위치·공종·접수일)", r))
             continue
-        else:
-            try:
-                val = Decimal(a)
-            except Exception:
-                exclude(n, "6", f"면적이 숫자가 아님('{a}')", row)
-                continue
-            if val <= 0:
-                exclude(n, "7", f"면적이 0 이하({a})", row)
-                continue
-            if u not in UNITS:
-                exclude(n, "5", f"알 수 없는 면적단위('{u}')", row)
-                continue
-            if u == "평":
-                rec["area"] = val * PYEONG
-                fixed.append((n, f"규칙5: 면적 | {a}평 → {val * PYEONG:.4f}㎡ (×{PYEONG})"))
-            else:
-                rec["area"] = val
-        kept.append(rec)
+        seen_no.add(no)
+        seen_key.add(key)
+        area_txt = r[col["보수면적"]].strip()
+        area = Decimal(area_txt) if area_txt else Decimal("0")
+        if r[col["면적단위"]].strip() == "평":
+            notes.append(f"면적 {area_txt}평 → {area * PYEONG}㎡")
+            area = area * PYEONG
+        kept.append({"type": r[col["공종"]].strip(), "status": r[col["처리상태"]].strip(),
+                     "urgent": r[col["긴급구분"]].strip(), "area": area})
+        if notes:
+            fixed.append((n, no, "; ".join(notes)))
 
-    # 3 준중복 (표준화 후 위치+공종+내용 동일, 접수번호 다름)
-    groups = {}
-    for r in kept:
-        groups.setdefault((r["loc"], r["trade"], r["content"]), []).append(r)
-    for key, rs in groups.items():
-        if len({r["id"] for r in rs}) > 1:
-            ids = ", ".join(f"{r['id']}({r['n']}번)" for r in rs)
-            for r in rs:
-                flags.append((r["n"], f"규칙3: 준중복 {ids} | 포함 | {{확인 필요: 같은 건인지}}"))
+    total_area = sum((k["area"] for k in kept), Decimal("0")).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    summary = [["전체", "정상 건수", str(len(kept)), "건"]]
+    summary += [["공종", t, str(sum(1 for k in kept if k["type"] == t)), "건"] for t in TYPES]
+    summary += [["처리상태", s, str(sum(1 for k in kept if k["status"] == s)), "건"] for s in STATUSES]
+    summary += [["긴급", "긴급", str(sum(1 for k in kept if k["urgent"] == "긴급")), "건"],
+                ["면적", "보수면적 합계", str(total_area), "㎡"]]
 
-    # summary
-    agg = OrderedDict()
-    for r in sorted(kept, key=lambda r: (r["trade"], r["status"], r["urg"])):
-        k = (r["trade"], r["status"], r["urg"])
-        s = agg.setdefault(k, [0, 0, Decimal(0)])
-        s[0] += 1
-        if r["area"] is not None:
-            s[1] += 1
-            s[2] += r["area"]
-    OUT.mkdir(parents=True, exist_ok=True)
-    with open(OUT / "summary.csv", "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["공종", "처리상태", "긴급구분", "건수", "면적기재건수", "면적합계_㎡"])
-        for (t, s_, u_), (c, ac, ar) in agg.items():
-            w.writerow([t, s_, u_, c, ac, q2(ar)])
-    with open(OUT / "excluded_rows.csv", "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
+    os.makedirs(a.out, exist_ok=True)
+    with open(os.path.join(a.out, "summary.csv"), "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, lineterminator="\r\n")
+        w.writerow(["구분", "항목", "값", "단위"])
+        w.writerows(summary)
+    with open(os.path.join(a.out, "excluded_rows.csv"), "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, lineterminator="\r\n")
         w.writerow(["원본행", "사유", "원본값"])
-        w.writerows(excluded)
+        w.writerows([[str(n), why, "|".join(r)] for n, why, r in excluded])
 
-    total_area = q2(sum((r["area"] for r in kept if r["area"] is not None), Decimal(0)))
-    blank = [r["n"] for r in kept if r["area"] is None]
-    hash_after = sha256(INPUT)
-
-    # 8 합계 대조
-    orig_total = next((r for r in data if not ID_RE.match(r[0].strip())), None)
-    orig_cnt = orig_area = None
-    if orig_total:
-        m = re.match(r"(\d+)", orig_total[col["하자내용"]])
-        orig_cnt = int(m[1]) if m else None
-        orig_area = Decimal(orig_total[col["보수면적"]]) if orig_total[col["보수면적"]] else None
-    raw_sum = sum((Decimal(r["area_s"]) for r in kept if r["area_s"] and r["n"] <= n_orig), Decimal(0))
-
-    L = []
-    L.append("# M2 실행 기록\n")
-    L.append("## 실행 정보")
-    L.append(f"- 실행 명령: `python3 {' '.join(sys.argv)}`")
-    L.append(f"- 입력 파일: `inputs/m2/{SRC}` (읽기 전용)")
-    L.append(f"- 규칙 문서: `rules/aggregation_rules.md`")
-    L.append(f"- 입력 SHA-256 실행 전/후: {hash_before[:16]}… / {hash_after[:16]}… → {'동일(수정 없음)' if hash_before == hash_after else '불일치!'}")
-    L.append(f"- 평→㎡ 환산 계수: {PYEONG} {{확인 필요: 자료에 근거 없는 가정값}}\n")
-    L.append("## 행 수 전후")
-    L.append(f"- 처리 전: 데이터 {n_orig}행 (합계 행 포함)" + (f" + 보완 {n_supp}행(`outputs/m3/supplement_A-M3-03.csv`, 원본 {n_orig + 1}~{n_orig + n_supp}번)" if n_supp else ""))
-    L.append(f"- 처리 후: 집계 포함 {len(kept)}행, 제외 {len(excluded)}행\n")
-    L.append("## 규칙별 제외 수")
-    L.append("| 규칙 | 제외 수 | 원본행 |")
-    L.append("|---|---|---|")
-    for rule in ["1", "2", "5", "6", "7"]:
-        rws = [str(e[0]) for e in excluded if e[1].startswith(f"규칙{rule}:")]
-        L.append(f"| {rule} | {len(rws)} | {', '.join(rws) or '-'} |")
-    L.append("\n## 고쳐서 포함한 행")
-    L.append("[값 | 출처 파일 | 위치(데이터 행) | 처리]")
-    for n, msg in sorted(fixed):
-        a, b = msg.split(" | ", 1)
-        L.append(f"- [{b} | {SRC} | {n}번 | 고쳐서 포함 ({a})]")
-    L.append("\n## 포함했으나 확인 필요")
-    for n, msg in sorted(set(flags)):
-        L.append(f"- {n}번: {msg}")
-    L.append("\n## 면적 공란 (건수만 포함, 면적 합계 제외)")
-    L.append(f"- {len(blank)}행: {', '.join(map(str, blank))}")
-    L.append("- 빈칸이 0인지 해당 없음인지 {확인 필요: 면적 공란의 의미}")
-    L.append("\n## 합계 대조 (규칙 8)")
-    L.append(f"- 원본 합계 행: 건수 {orig_cnt}건, 면적 {orig_area}")
-    L.append(f"- 처리 결과: 건수 {len(kept)}건, 면적 {total_area}㎡")
-    L.append(f"- 건수 차이 {None if orig_cnt is None else orig_cnt - (len(kept) - n_supp)}건(보완 {n_supp}건 제외 기준): 규칙2 완전 중복 제외 {excl_by_rule['2']}건")
-    L.append(f"- 면적: 원본 {orig_area}는 ㎡·평 혼합 단순합. 포함 행(보완 제외)의 원본 숫자 단순합 {raw_sum}, 보완 {n_supp}건 면적 포함·평 환산 후 {total_area}㎡")
-    (OUT / "run_log.md").write_text("\n".join(L) + "\n", encoding="utf-8")
-    print(f"포함 {len(kept)}행 / 제외 {len(excluded)}행 / 면적 {total_area}㎡ / 입력 불변={hash_before == hash_after}")
+    counts = {}
+    for _, why, _ in excluded:
+        counts[why] = counts.get(why, 0) + 1
+    out = a.out.replace("\\", "/")
+    lines = [NOTICE, "", "# 집계 실행 기록", "",
+             f"- 실행 명령: `python scripts/aggregate.py {a.input} --out {out}`",
+             f"- 입력 파일: `{a.input}`(수정하지 않음)",
+             "- 집계 기준: `rules/aggregation_rules.md`",
+             f"- 입력 데이터 행: {len(rows)}행(머리행 제외)",
+             f"- 집계 대상 행: {len(kept)}행",
+             f"- 제외 행: {len(excluded)}행"]
+    lines += [f"  - {k}: {v}행" for k, v in counts.items()]
+    lines.append(f"- 수정 후 포함 행: {len(fixed)}행")
+    lines += ["", "| 원본행 | 접수번호 | 수정 내용 |", "|---|---|---|"]
+    lines += [f"| {n} | {no} | {t} |" for n, no, t in fixed]
+    lines += ["", "## 결과", "", "| 구분 | 항목 | 값 | 단위 |", "|---|---|---|---|"]
+    lines += [f"| {x[0]} | {x[1]} | {x[2]} | {x[3]} |" for x in summary]
+    with open(os.path.join(a.out, "run_log.md"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"정상 {len(kept)}행 · 제외 {len(excluded)}행 · 수정 {len(fixed)}행 · 보수면적 합계 {total_area}㎡ → {out}")
 
 
 if __name__ == "__main__":
