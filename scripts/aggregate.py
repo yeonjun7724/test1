@@ -40,14 +40,18 @@ def normalize_location(raw):
 
 
 def check_date(raw):
-    """접수일 검사(M2 기준에는 접수일 규칙이 없으므로 그대로 쓴다)."""
-    return raw.strip(), None
+    """접수일 검사(rules 5): YYYY-MM-DD가 아니면 None → 보류(확인 필요)."""
+    d = raw.strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+        return None, None
+    return d, None
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--area-fix", action="append", default=[], help="접수번호=실측값(㎡), 별도 행으로만 계산")
     a = ap.parse_args()
     with open(a.input, encoding="utf-8-sig", newline="") as f:
         rd = csv.reader(f)
@@ -71,7 +75,7 @@ def main():
             notes.append(f"위치코드 {r[col['위치코드']].strip()} → {code}")
         date, date_note = check_date(r[col["접수일"]])
         if date is None:
-            excluded.append((n, "날짜 확인 필요", r))
+            excluded.append((n, "확인 필요(접수일 표기)", r))
             continue
         if date_note:
             notes.append(date_note)
@@ -89,7 +93,7 @@ def main():
         if r[col["면적단위"]].strip() == "평":
             notes.append(f"면적 {area_txt}평 → {area * PYEONG}㎡")
             area = area * PYEONG
-        kept.append({"type": r[col["공종"]].strip(), "status": r[col["처리상태"]].strip(),
+        kept.append({"no": no, "type": r[col["공종"]].strip(), "status": r[col["처리상태"]].strip(),
                      "urgent": r[col["긴급구분"]].strip(), "area": area})
         if notes:
             fixed.append((n, no, "; ".join(notes)))
@@ -100,6 +104,18 @@ def main():
     summary += [["처리상태", s, str(sum(1 for k in kept if k["status"] == s)), "건"] for s in STATUSES]
     summary += [["긴급", "긴급", str(sum(1 for k in kept if k["urgent"] == "긴급")), "건"],
                 ["면적", "보수면적 합계", str(total_area), "㎡"]]
+    fixnotes = []
+    if a.area_fix:
+        fix_total = sum((k["area"] for k in kept), Decimal("0"))
+        for item in a.area_fix:
+            no, val = item.split("=")
+            tgt = [k for k in kept if k["no"] == no]
+            if not tgt:
+                fixnotes.append(f"{no}: 집계 대상 아님 — 정정 미적용")
+                continue
+            fix_total += Decimal(val) - tgt[0]["area"]
+            fixnotes.append(f"{no}: {tgt[0]['area']}㎡ → {val}㎡")
+        summary.append(["면적", "보수면적 합계(실측 정정 반영)", str(fix_total.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)), "㎡"])
 
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "summary.csv"), "w", encoding="utf-8-sig", newline="") as f:
@@ -116,7 +132,7 @@ def main():
         counts[why] = counts.get(why, 0) + 1
     out = a.out.replace("\\", "/")
     lines = [NOTICE, "", "# 집계 실행 기록", "",
-             f"- 실행 명령: `python scripts/aggregate.py {a.input} --out {out}`",
+             f"- 실행 명령: `python scripts/aggregate.py {a.input} --out {out}" + "".join(f" --area-fix {x}" for x in a.area_fix) + "`",
              f"- 입력 파일: `{a.input}`(수정하지 않음)",
              "- 집계 기준: `rules/aggregation_rules.md`",
              f"- 입력 데이터 행: {len(rows)}행(머리행 제외)",
@@ -124,6 +140,7 @@ def main():
              f"- 제외 행: {len(excluded)}행"]
     lines += [f"  - {k}: {v}행" for k, v in counts.items()]
     lines.append(f"- 수정 후 포함 행: {len(fixed)}행")
+    lines += [f"- 면적 정정(--area-fix): {x}" for x in fixnotes]
     lines += ["", "| 원본행 | 접수번호 | 수정 내용 |", "|---|---|---|"]
     lines += [f"| {n} | {no} | {t} |" for n, no, t in fixed]
     lines += ["", "## 결과", "", "| 구분 | 항목 | 값 | 단위 |", "|---|---|---|---|"]
