@@ -40,11 +40,14 @@ def normalize_location(raw):
 
 
 def check_date(raw):
-    """접수일 검사(rules 5): YYYY-MM-DD가 아니면 None → 보류(확인 필요)."""
+    """접수일 검사(rules 5): 표준이면 그대로, 5-1이면 구분자만 '-'로, 그 밖에는 None(확인 필요)."""
     d = raw.strip()
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
-        return None, None
-    return d, None
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+        return d, None
+    if re.match(r"^\d{4}[./]\d{2}[./]\d{2}$", d):
+        fixed = re.sub(r"[./]", "-", d)
+        return fixed, f"접수일 {d} → {fixed}"
+    return None, None
 
 
 def main():
